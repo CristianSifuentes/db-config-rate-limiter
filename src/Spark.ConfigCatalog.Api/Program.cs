@@ -1,5 +1,6 @@
 using System.Threading.RateLimiting;
 using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Spark.ConfigCatalog.Api;
 using Spark.ConfigCatalog.Domain;
@@ -39,7 +40,77 @@ builder.Services.AddSingleton<IRateLimitConfigAccessor>(sp => sp.GetRequiredServ
 
 builder.Services.AddHostedService<RateLimitConfigWarmupHostedService>();
 
+//builder.Services.AddRateLimiter(o => { o.AddConcurrencyLimiter() });
+
 // --- Rate limiting configured from DB-backed accessor ---
+#region Rate Limiting Old Verison
+//builder.Services.AddRateLimiter(o =>
+//{
+//    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+//    o.OnRejected = async (context, ct) =>
+//    {
+//        var http = context.HttpContext;
+//        http.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+//        http.Response.ContentType = "application/problem+json";
+
+//        // Don't leak internal counters; just tell clients to retry later.
+//        await http.Response.WriteAsJsonAsync(new
+//        {
+//            type = "https://errors.spark.example.com/security/rate-limited",
+//            title = "Too many requests.",
+//            status = StatusCodes.Status429TooManyRequests,
+//            detail = "Slow down and retry later.",
+//            errorCode = "rate_limited",
+//            traceId = http.TraceIdentifier
+//        }, ct);
+//    };
+
+//    // Global limiter: prefer user -> client -> ip
+//    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
+//    {
+//        var key =
+//            RateLimitKeyFactory.GetUserKey(ctx) != "user:anonymous" ? RateLimitKeyFactory.GetUserKey(ctx)
+//            : RateLimitKeyFactory.GetClientKey(ctx) != "client:anonymous" ? RateLimitKeyFactory.GetClientKey(ctx)
+//            : RateLimitKeyFactory.GetIpFallback(ctx);
+
+//        var limits = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>().Global;
+
+//        return RateLimitPartition.GetTokenBucketLimiter(
+//            partitionKey: key,
+//            factory: _ => new TokenBucketRateLimiterOptions
+//            {
+//                TokenLimit = Math.Max(1, limits.BurstPer10Seconds),
+//                TokensPerPeriod = Math.Max(1, limits.PerIdentityPerMinute),
+//                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+//                QueueLimit = 0,
+//                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+//                AutoReplenishment = true
+//            });
+//    });
+
+//    // Example policy: exports tenant fairness
+//    o.AddPolicy("exports-tenant", ctx =>
+//    {
+//        var tenantId = RateLimitKeyFactory.GetTenantKey(ctx);
+//        var enterprise = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>().GetEnterpriseForTenant(tenantId);
+
+//        return RateLimitPartition.GetFixedWindowLimiter(
+//            partitionKey: tenantId,
+//            factory: _ => new FixedWindowRateLimiterOptions
+//            {
+//                PermitLimit = Math.Max(1, enterprise.Exports.PerTenantPerMinute),
+//                Window = TimeSpan.FromMinutes(1),
+//                QueueLimit = 0,
+//                AutoReplenishment = true
+//            });
+//    });
+
+
+//});
+#endregion
+
+#region Rate Limiting New Version
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -47,10 +118,13 @@ builder.Services.AddRateLimiter(o =>
     o.OnRejected = async (context, ct) =>
     {
         var http = context.HttpContext;
+
         http.Response.StatusCode = StatusCodes.Status429TooManyRequests;
         http.Response.ContentType = "application/problem+json";
 
-        // Don't leak internal counters; just tell clients to retry later.
+        // Opcional: Retry-After (segundos). Para FixedWindow queda perfecto.
+        http.Response.Headers["Retry-After"] = "60";
+
         await http.Response.WriteAsJsonAsync(new
         {
             type = "https://errors.spark.example.com/security/rate-limited",
@@ -62,7 +136,10 @@ builder.Services.AddRateLimiter(o =>
         }, ct);
     };
 
-    // Global limiter: prefer user -> client -> ip
+    // ---------------------------------------------------------------------
+    // GLOBAL limiter (defense-in-depth): user -> client -> ip
+    // - This applies to EVERYTHING (unless you decide to exclude certain routes).
+    // ---------------------------------------------------------------------
     o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
     {
         var key =
@@ -85,17 +162,188 @@ builder.Services.AddRateLimiter(o =>
             });
     });
 
-    // Example policy: exports tenant fairness
+    // =====================================================================
+    // EXPORTS (heavy endpoints)
+    // JSON:
+    // exports: perTenantPerMinute=600, perClientPerMinute=300, perUserPerMinute=120
+    // =====================================================================
+
     o.AddPolicy("exports-tenant", ctx =>
     {
         var tenantId = RateLimitKeyFactory.GetTenantKey(ctx);
-        var enterprise = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>().GetEnterpriseForTenant(tenantId);
+        var ent = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>()
+            .GetEnterpriseForTenant(tenantId);
+
+        // key estable
+        var key = string.IsNullOrWhiteSpace(tenantId) ? "tenant:unknown" : tenantId;
 
         return RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: tenantId,
+            partitionKey: key,
             factory: _ => new FixedWindowRateLimiterOptions
             {
-                PermitLimit = Math.Max(1, enterprise.Exports.PerTenantPerMinute),
+                PermitLimit = Math.Max(1, ent.Exports.PerTenantPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    o.AddPolicy("exports-client", ctx =>
+    {
+        var clientKey = RateLimitKeyFactory.GetClientKey(ctx); // e.g. "client:{azp}"
+        var key = clientKey != "client:anonymous"
+            ? clientKey
+            : RateLimitKeyFactory.GetIpFallback(ctx); // fallback anti-abuse
+
+        var accessor = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>();
+        var ent = key.StartsWith("client:", StringComparison.OrdinalIgnoreCase)
+            ? accessor.GetEnterpriseForClient(key["client:".Length..])
+            : accessor.EnterpriseGlobal;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Exports.PerClientPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    o.AddPolicy("exports-user", ctx =>
+    {
+        var userKey = RateLimitKeyFactory.GetUserKey(ctx); // e.g. "user:{oid}"
+        var key = userKey != "user:anonymous"
+            ? userKey
+            : RateLimitKeyFactory.GetIpFallback(ctx);
+
+        // In SPARK: If your rate tier per user depends on the tenant (common), use tenant:
+
+        var tenantId = RateLimitKeyFactory.GetTenantKey(ctx);
+        var ent = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>()
+            .GetEnterpriseForTenant(tenantId);
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Exports.PerUserPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    // =====================================================================
+    // SEARCH (query endpoints)
+    // JSON:
+    // search: perTenantPerMinute=900, perClientPerMinute=600, perUserPerMinute=240
+    // =====================================================================
+
+    o.AddPolicy("search-tenant", ctx =>
+    {
+        var tenantId = RateLimitKeyFactory.GetTenantKey(ctx);
+        var ent = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>()
+            .GetEnterpriseForTenant(tenantId);
+
+        var key = string.IsNullOrWhiteSpace(tenantId) ? "tenant:unknown" : tenantId;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Search.PerTenantPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    o.AddPolicy("search-client", ctx =>
+    {
+        var clientKey = RateLimitKeyFactory.GetClientKey(ctx);
+        var key = clientKey != "client:anonymous"
+            ? clientKey
+            : RateLimitKeyFactory.GetIpFallback(ctx);
+
+        var accessor = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>();
+        var ent = key.StartsWith("client:", StringComparison.OrdinalIgnoreCase)
+            ? accessor.GetEnterpriseForClient(key["client:".Length..])
+            : accessor.EnterpriseGlobal;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Search.PerClientPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    o.AddPolicy("search-user", ctx =>
+    {
+        var userKey = RateLimitKeyFactory.GetUserKey(ctx);
+        var key = userKey != "user:anonymous"
+            ? userKey
+            : RateLimitKeyFactory.GetIpFallback(ctx);
+
+        var tenantId = RateLimitKeyFactory.GetTenantKey(ctx);
+        var ent = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>()
+            .GetEnterpriseForTenant(tenantId);
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Search.PerUserPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    // =====================================================================
+    // LOGIN (credential stuffing protection)
+    // JSON:
+    // login: perIpPerMinute=30, perClientPerMinute=60
+    // =====================================================================
+
+    o.AddPolicy("login-ip", ctx =>
+    {
+        var ip = RateLimitKeyFactory.GetIpFallback(ctx);
+        var ent = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>().EnterpriseGlobal;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: ip,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Login.PerIpPerMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
+    o.AddPolicy("login-client", ctx =>
+    {
+        var clientKey = RateLimitKeyFactory.GetClientKey(ctx);
+        var key = clientKey != "client:anonymous"
+            ? clientKey
+            : RateLimitKeyFactory.GetIpFallback(ctx);
+
+        var accessor = ctx.RequestServices.GetRequiredService<IRateLimitConfigAccessor>();
+        var ent = key.StartsWith("client:", StringComparison.OrdinalIgnoreCase)
+            ? accessor.GetEnterpriseForClient(key["client:".Length..])
+            : accessor.EnterpriseGlobal;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: key,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, ent.Login.PerClientPerMinute),
                 Window = TimeSpan.FromMinutes(1),
                 QueueLimit = 0,
                 AutoReplenishment = true
@@ -103,6 +351,7 @@ builder.Services.AddRateLimiter(o =>
     });
 });
 
+#endregion
 var app = builder.Build();
 
 // Ensure DB exists + seed defaults (demo convenience).
