@@ -1,11 +1,16 @@
-using System.Threading.RateLimiting;
 using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Spark.ConfigCatalog.Api;
 using Spark.ConfigCatalog.Domain;
 using Spark.ConfigCatalog.Infrastructure;
+using Spark.ConfigCatalog.Infrastructure.RateLimiting;
+using Spark.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
+using Spark.ConfigCatalog.Infrastructure.RateLimiting.Store;
 using Spark.ConfigCatalog.Infrastructure.Services;
+using System.Threading.Channels;
+using System.Threading.RateLimiting;
+using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -39,6 +44,35 @@ builder.Services.AddSingleton<RateLimitConfigAccessor>();
 builder.Services.AddSingleton<IRateLimitConfigAccessor>(sp => sp.GetRequiredService<RateLimitConfigAccessor>());
 
 builder.Services.AddHostedService<RateLimitConfigWarmupHostedService>();
+
+
+builder.Services.AddSingleton(Channel.CreateBounded<RateLimitAuditEvent>(
+    new BoundedChannelOptions(50_000) { SingleReader = true, SingleWriter = false }));
+
+builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Writer);
+builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Reader);
+
+builder.Services.AddSingleton<RateLimitAuditMiddleware>();
+
+builder.Services.AddSingleton<IRateLimitAuditStore, SqlServerRateLimitAuditStore>();
+
+builder.Services.AddHostedService<RateLimitAuditWriterHostedService>();
+
+//4) Bonus: diseño maestro-detalle(auditoría avanzada)
+
+//Tu modelo queda “enterprise-grade” así:
+
+//RateLimitIdentity(Maestro)
+//Identidad estable(Tenant/Client/User/Ip) con KeyHash seguro.
+
+//RateLimitMinuteAgg (Hechos / métrica)
+//Conteo por minuto por policy + identity (ideal para dashboards).
+
+//RateLimitViolation (Eventos)
+//Cada 429 (o bloqueo) con razón, traceId, correlationId.
+
+//RateLimitBlock (Estado)
+//“bloqueos activos” (y hasta cuándo), con razón.
 
 //builder.Services.AddRateLimiter(o => { o.AddConcurrencyLimiter() });
 
@@ -352,6 +386,8 @@ builder.Services.AddRateLimiter(o =>
 });
 
 #endregion
+
+
 var app = builder.Build();
 
 // Ensure DB exists + seed defaults (demo convenience).
@@ -373,7 +409,12 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 
 app.UseRateLimiter();
+#region Security Middleware (Pre-Auth)
+app.UseMiddleware<RateLimitAuditMiddleware>();
 
+#endregion
+
+#region End Points
 // --- Demo endpoints ---
 app.MapGet("/", () => Results.Ok(new { ok = true, message = "SPARK Config Catalog demo" }));
 
@@ -457,6 +498,8 @@ admin.MapPost("/{conceptKey}/{entryKey}", async (
 });
 
 app.Run();
+
+#endregion
 
 internal sealed record AdminUpsertConfigEntryDto(
     string ValueType,

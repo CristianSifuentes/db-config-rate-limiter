@@ -1,34 +1,27 @@
 using System.Security.Claims;
+using Microsoft.AspNetCore.Http;
 
-namespace Spark.ConfigCatalog.Api;
-
-public static class RateLimitKeyFactory
+namespace Spark.ConfigCatalog.Api
 {
-    public static string GetUserKey(HttpContext ctx)
+    public static class RateLimitKeyFactory
     {
-        var oid = ctx.User?.FindFirstValue("oid")
-            ?? ctx.User?.FindFirstValue(ClaimTypes.NameIdentifier);
+        public static string GetTenantKey(HttpContext ctx)
+            => ctx.User.FindFirstValue("tid")
+               ?? "tenant:anonymous";
 
-        return !string.IsNullOrWhiteSpace(oid) ? $"user:{oid}" : "user:anonymous";
+        public static string GetClientKey(HttpContext ctx)
+            => ctx.User.FindFirstValue("azp")
+               ?? ctx.User.FindFirstValue("appid")
+               ?? "client:anonymous";
+
+        public static string GetUserKey(HttpContext ctx)
+            => ctx.User.FindFirstValue("oid")
+               ?? ctx.User.FindFirstValue(ClaimTypes.NameIdentifier)
+               ?? "user:anonymous";
+
+        public static string GetIpFallback(HttpContext ctx)
+            => ctx.Connection.RemoteIpAddress?.ToString()
+               ?? "ip:unknown";
     }
 
-    public static string GetClientKey(HttpContext ctx)
-    {
-        var client = ctx.User?.FindFirstValue("azp")
-            ?? ctx.User?.FindFirstValue("appid");
-
-        return !string.IsNullOrWhiteSpace(client) ? $"client:{client}" : "client:anonymous";
-    }
-
-    public static string GetTenantKey(HttpContext ctx)
-    {
-        var tid = ctx.User?.FindFirstValue("tid");
-        return !string.IsNullOrWhiteSpace(tid) ? tid : "tenant:anonymous";
-    }
-
-    public static string GetIpFallback(HttpContext ctx)
-    {
-        var ip = ctx.Connection.RemoteIpAddress?.ToString();
-        return !string.IsNullOrWhiteSpace(ip) ? $"ip:{ip}" : "ip:unknown";
-    }
 }
