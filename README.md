@@ -1,4 +1,4 @@
-# SPARK DB‑Backed Configuration Catalog + Dynamic Rate Limiting (NET 8)
+# App DB‑Backed Configuration Catalog + Dynamic Rate Limiting (NET 8)
 
 This repo is a **reference implementation** of a **DB‑backed configuration catalog** that:
 
@@ -18,11 +18,11 @@ It’s designed to match enterprise constraints:
 ## Project structure
 
 ```
-/spark-db-config-rate-limiter
+/App-db-config-rate-limiter
   /src
-    /Spark.ConfigCatalog.Domain          # contracts + typed option models
-    /Spark.ConfigCatalog.Infrastructure  # EF entities + provider + cache + warmup service
-    /Spark.ConfigCatalog.Api             # sample Web API showing RateLimiter integration
+    /App.ConfigCatalog.Domain          # contracts + typed option models
+    /App.ConfigCatalog.Infrastructure  # EF entities + provider + cache + warmup service
+    /App.ConfigCatalog.Api             # sample Web API showing RateLimiter integration
 ```
 
 ---
@@ -91,12 +91,12 @@ Result:
 ### Start
 
 ```bash
-cd src/Spark.ConfigCatalog.Api
+cd src/App.ConfigCatalog.Api
 dotnet restore
 dotnet run
 ```
 
-The demo uses **SQLite** by default (`spark-config.db`) so you can run instantly.
+The demo uses **SQLite** by default (`App-config.db`) so you can run instantly.
 
 To switch to SQL Server, change `ConnectionStrings:ConfigCatalog` to a SQL Server connection string and update the provider in `Program.cs` accordingly.
 
@@ -116,19 +116,19 @@ To switch to SQL Server, change `ConnectionStrings:ConfigCatalog` to a SQL Serve
 
 ---
 
-## How to integrate into your SPARK solution
+## How to integrate into your App solution
 
 ### 1) Add the tables and entities
 Either:
 
-- **Option A (recommended):** add `DbSet<ConfigConcept>` and `DbSet<ConfigEntry>` into your existing `SPARKDbContext`
-- **Option B:** keep a dedicated `SparkConfigDbContext` (as in this demo)
+- **Option A (recommended):** add `DbSet<ConfigConcept>` and `DbSet<ConfigEntry>` into your existing `AppDbContext`
+- **Option B:** keep a dedicated `AppConfigDbContext` (as in this demo)
 
 ### 2) Register services
 
 Use the same registration pattern as the demo:
 
-- `AddDbContextFactory<SPARKDbContext>()`
+- `AddDbContextFactory<AppDbContext>()`
 - `AddMemoryCache()`
 - `AddSingleton<IConfigProvider, DbConfigProvider>()`
 - `AddSingleton<IRateLimitConfigAccessor, RateLimitConfigAccessor>()`
