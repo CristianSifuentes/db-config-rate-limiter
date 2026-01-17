@@ -14,7 +14,7 @@ public sealed record RateLimitAuditEvent(
     DateTimeOffset AtUtc,
     string Policy,
     string IdentityKind,
-    string IdentityKey,          // tenant:xxx | client:yyy | user:zzz | ip:...
+    string IdentityKey,      // tenant:xxx | client:yyy | user:zzz | ip:...
     string Method,
     string Path,
     int StatusCode,

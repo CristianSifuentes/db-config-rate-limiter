@@ -11,6 +11,10 @@ using App.ConfigCatalog.Infrastructure.Services;
 using System.Threading.Channels;
 using System.Threading.RateLimiting;
 using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using App.ConfigCatalog.Infrastructure.Token;
+using System.IdentityModel.Tokens.Jwt;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,6 +25,29 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddApplicationInsightsTelemetry();
 
 builder.Services.AddMemoryCache();
+
+
+#region Configuration (Options & Entra)
+
+var azureAd = builder.Configuration.GetSection("AzureAd");
+
+// In Entra ID multi-tenant APIs, you typically use:
+// - "common" (consumer + org accounts), or
+// - "organizations", or
+// - a specific tenantId.
+// Use with caution based on your product’s tenancy model.
+var instance = azureAd["Instance"] ?? "https://login.microsoftonline.com/";
+var tenantId = azureAd["TenantId"] ?? "common";
+var authority = $"{instance.TrimEnd('/')}/{tenantId}/v2.0";
+
+// Audience is typically api://{API_CLIENT_ID} (recommended).
+var audience =
+    azureAd["Audience"] ??
+    throw new InvalidOperationException("AzureAd:Audience is required (e.g., api://{API_CLIENT_ID}).");
+
+
+#endregion
+
 
 // --- DB ---
 // For the demo we use SQLite by default (easy local run) with optional SQL Server.
@@ -37,27 +64,10 @@ builder.Services.AddDbContextFactory<AppConfigDbContext>(opt =>
         opt.UseSqlServer(conn);
 });
 
-// --- Config catalog services ---
-builder.Services.AddSingleton<IConfigProvider, DbConfigProvider>();
-
-builder.Services.AddSingleton<RateLimitConfigAccessor>();
-builder.Services.AddSingleton<IRateLimitConfigAccessor>(sp => sp.GetRequiredService<RateLimitConfigAccessor>());
-
-builder.Services.AddHostedService<RateLimitConfigWarmupHostedService>();
 
 
-builder.Services.AddSingleton(Channel.CreateBounded<RateLimitAuditEvent>(
-    new BoundedChannelOptions(50_000) { SingleReader = true, SingleWriter = false }));
 
-builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Writer);
-builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Reader);
-
-builder.Services.AddSingleton<RateLimitAuditMiddleware>();
-
-builder.Services.AddSingleton<IRateLimitAuditStore, SqlServerRateLimitAuditStore>();
-
-builder.Services.AddHostedService<RateLimitAuditWriterHostedService>();
-
+#region Info
 //4) Bonus: diseño maestro-detalle(auditoría avanzada)
 
 //Tu modelo queda “enterprise-grade” así:
@@ -73,10 +83,130 @@ builder.Services.AddHostedService<RateLimitAuditWriterHostedService>();
 
 //RateLimitBlock (Estado)
 //“bloqueos activos” (y hasta cuándo), con razón.
+#endregion
 
 //builder.Services.AddRateLimiter(o => { o.AddConcurrencyLimiter() });
 
 // --- Rate limiting configured from DB-backed accessor ---
+#region Authentication (JWT Bearer) — Hardened Validation
+
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.Authority = authority;
+        options.RequireHttpsMetadata = true;
+
+        // Read hardening options once (fallback to defaults).
+        var hardening =
+            builder.Configuration.GetSection("TokenHardening").Get<TokenHardeningOptions>() ?? new();
+
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            // Require cryptographic integrity and expiration.
+            RequireSignedTokens = true,
+            ValidateIssuerSigningKey = true,
+            RequireExpirationTime = true,
+
+            // Issuer must be from allow-list logic (multi-tenant safe).
+            ValidateIssuer = true,
+            IssuerValidator = TenantAllowListIssuerValidator.Build(builder.Configuration),
+
+            // Strict audience validation to prevent token substitution across APIs.
+            ValidateAudience = true,
+            ValidAudiences = new[]
+            {
+                audience,
+                azureAd["ClientId"] // optional fallback, if you also accept clientId as aud (be deliberate).
+            }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray(),
+
+            // Enforce exp/nbf with minimal skew to tolerate clock drift.
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromSeconds(Math.Clamp(hardening.ClockSkewSeconds, 0, 120)),
+
+            // Algorithm allow-list. For Entra access tokens RS256 is standard; ES256 can be enabled if applicable.
+            ValidAlgorithms = new[]
+            {
+                SecurityAlgorithms.RsaSha256,   // RS256
+                SecurityAlgorithms.EcdsaSha256  // ES256 (optional)
+            },
+
+            // Keep claims aligned with Entra.
+            NameClaimType = "name",
+            RoleClaimType = "roles",
+        };
+
+        // Key rollover safe (kid rotates).
+        options.RefreshOnIssuerKeyNotFound = true;
+
+        // Avoid persisting tokens server-side.
+        options.SaveToken = false;
+
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async ctx =>
+            {
+
+                Console.WriteLine(ctx.Principal.Claims.Count().ToString());
+            },
+
+            OnAuthenticationFailed = ctx =>
+            {
+                // Do not leak details; store a safe reason for ProblemDetails middleware.
+                var reason =
+                    ctx.Exception is SecurityTokenExpiredException ? "token_expired" :
+                    ctx.Exception is SecurityTokenInvalidSignatureException ? "invalid_signature" :
+                    ctx.Exception is SecurityTokenInvalidAudienceException ? "invalid_audience" :
+                    ctx.Exception is SecurityTokenInvalidIssuerException ? "invalid_issuer" :
+                    ctx.Exception is SecurityTokenException ? "token_invalid" :
+                    "auth_failed";
+
+                ctx.HttpContext.Items["auth_fail_reason"] = reason;
+                ctx.HttpContext.Items["auth_failed"] = true;
+
+                return Task.CompletedTask;
+            },
+
+            OnChallenge = ctx =>
+            {
+                // Challenge occurs on 401, usually when no/invalid token.
+                ctx.HttpContext.Items["auth_fail_reason"] ??= "challenge";
+                return Task.CompletedTask;
+            },
+
+            OnForbidden = ctx =>
+            {
+                // Forbidden occurs on 403, usually when token valid but lacks required permission.
+                ctx.HttpContext.Items["auth_fail_reason"] ??= "forbidden_policy";
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+#endregion
+
+#region Authorization (Policies) — Scopes + App Roles
+
+builder.Services.AddAuthorization(options =>
+{
+    // Centralized configuration: keep policy definitions in one place.
+    AuthzPolicies.Configure(options, builder.Configuration);
+
+    #region Relevant1
+    //// Example "role-only" policy (use sparingly; scopes/app roles are usually better in multi-tenant APIs).
+    //options.AddPolicy("AdminOnly", p =>
+    //{
+    //    p.RequireAuthenticatedUser();
+    //    p.RequireRole("Admin");
+    //});
+    #endregion
+});
+
+#endregion
+
+
 #region Rate Limiting Old Verison
 //builder.Services.AddRateLimiter(o =>
 //{
@@ -387,8 +517,34 @@ builder.Services.AddRateLimiter(o =>
 
 #endregion
 
+#region Dependency Injection (Services + Middleware)
+// --- Config catalog services ---
+builder.Services.AddSingleton<IConfigProvider, DbConfigProvider>();
+
+builder.Services.AddSingleton<RateLimitConfigAccessor>();
+builder.Services.AddSingleton<IRateLimitConfigAccessor>(sp => sp.GetRequiredService<RateLimitConfigAccessor>());
+
+builder.Services.AddHostedService<RateLimitConfigWarmupHostedService>();
+
+
+builder.Services.AddSingleton(Channel.CreateBounded<RateLimitAuditEvent>(
+    new BoundedChannelOptions(50_000) { SingleReader = true, SingleWriter = false }));
+
+builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Writer);
+builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Reader);
+
+builder.Services.AddSingleton<RateLimitAuditMiddleware>();
+
+builder.Services.AddSingleton<IRateLimitAuditStore, SqlServerRateLimitAuditStore>();
+
+builder.Services.AddHostedService<RateLimitAuditWriterHostedService>();
+#endregion
+
+#region Build App
 
 var app = builder.Build();
+
+#endregion
 
 // Ensure DB exists + seed defaults (demo convenience).
 // In App you likely do migrations + admin seeding.
@@ -408,10 +564,21 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.UseRateLimiter();
 #region Security Middleware (Pre-Auth)
 app.UseMiddleware<RateLimitAuditMiddleware>();
 
+#endregion
+
+
+#region AuthN / AuthZ
+
+app.UseRateLimiter();
+
+// Authentication populates HttpContext.User.
+app.UseAuthentication();
+
+// Authorization enforces policies/scopes/roles.
+app.UseAuthorization();
 #endregion
 
 #region End Points
@@ -426,7 +593,9 @@ app.MapGet("/limits/current", (IRateLimitConfigAccessor a) => Results.Ok(new
 
 // A heavy endpoint to demonstrate policy usage
 app.MapGet("/exports", () => Results.Ok(new { exported = true, atUtc = DateTime.UtcNow }))
-   .RequireRateLimiting("exports-tenant");
+   .RequireRateLimiting("exports-tenant")
+   .RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName);
+
 
 // --- Admin: manage config entries (MVP). Secure this in real apps. ---
 var admin = app.MapGroup("/admin/config");

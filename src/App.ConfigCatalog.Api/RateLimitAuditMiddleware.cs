@@ -5,8 +5,6 @@ using System.Text;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.Http;
 
-
-
 namespace App.ConfigCatalog.Api
 {
     public sealed class RateLimitAuditMiddleware : IMiddleware

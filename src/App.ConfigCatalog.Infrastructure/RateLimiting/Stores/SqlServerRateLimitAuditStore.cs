@@ -1,7 +1,8 @@
-using Microsoft.Data.SqlClient;
-using Microsoft.EntityFrameworkCore;
 using App.ConfigCatalog.Infrastructure.Entities;
 using App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
 
 namespace App.ConfigCatalog.Infrastructure.RateLimiting.Store;
 
@@ -187,31 +188,73 @@ WHEN NOT MATCHED THEN
             }
         });
     }
-
-    private static async Task EnsureIdentityInternalAsync(AppConfigDbContext db, RateLimitIdentity row, CancellationToken ct)
+    private static async Task EnsureIdentityInternalAsync(
+    AppConfigDbContext db,
+    RateLimitIdentity row,
+    CancellationToken ct)
     {
-        // IF NOT EXISTS con UPDLOCK/HOLDLOCK evita duplicados bajo concurrencia
-        var sql = @"
+        const string sql = @"
 IF NOT EXISTS (
     SELECT 1 FROM RateLimitIdentity WITH (UPDLOCK, HOLDLOCK)
-    WHERE [Kind] = @p0 AND KeyHash = @p1
+    WHERE [Kind] = @Kind AND KeyHash = @KeyHash
 )
 BEGIN
-    INSERT INTO RateLimitIdentity([Kind], KeyHash, KeyPlain, TenantId, ClientId, UserId, Ip)
-    VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6);
+    INSERT INTO RateLimitIdentity
+        ([Kind], KeyHash, KeyPlain, TenantId, ClientId, UserId, Ip)
+    VALUES
+        (@Kind, @KeyHash, @KeyPlain, @TenantId, @ClientId, @UserId, @Ip);
 END";
 
-        await db.Database.ExecuteSqlRawAsync(sql, new object[]
-        {
-            row.Kind,
-            row.KeyHash,
-            (object?)row.KeyPlain ?? DBNull.Value,
-            (object?)row.TenantId ?? DBNull.Value,
-            (object?)row.ClientId ?? DBNull.Value,
-            (object?)row.UserId ?? DBNull.Value,
-            (object?)row.Ip ?? DBNull.Value
-        }, ct);
+        // IMPORTANTE: SqlParameter.Value = DBNull.Value (aquí sí es válido)
+        // porque EF recibe SqlParameter (no un object DBNull suelto).
+        var pKind = new SqlParameter("@Kind", SqlDbType.NVarChar, 20) { Value = row.Kind };
+        var pKeyHash = new SqlParameter("@KeyHash", SqlDbType.VarBinary, 32) { Value = row.KeyHash };
+
+        var pKeyPlain = new SqlParameter("@KeyPlain", SqlDbType.NVarChar, 256)
+        { Value = (object?)row.KeyPlain ?? DBNull.Value };
+
+        var pTenantId = new SqlParameter("@TenantId", SqlDbType.NVarChar, 64)
+        { Value = (object?)row.TenantId ?? DBNull.Value };
+
+        var pClientId = new SqlParameter("@ClientId", SqlDbType.NVarChar, 64)
+        { Value = (object?)row.ClientId ?? DBNull.Value };
+
+        var pUserId = new SqlParameter("@UserId", SqlDbType.NVarChar, 64)
+        { Value = (object?)row.UserId ?? DBNull.Value };
+
+        var pIp = new SqlParameter("@Ip", SqlDbType.NVarChar, 64)
+        { Value = (object?)row.Ip ?? DBNull.Value };
+
+        await db.Database.ExecuteSqlRawAsync(
+            sql,
+            new[] { pKind, pKeyHash, pKeyPlain, pTenantId, pClientId, pUserId, pIp },
+            ct);
     }
+
+    //    private static async Task EnsureIdentityInternalAsync(AppConfigDbContext db, RateLimitIdentity row, CancellationToken ct)
+    //    {
+    //        // IF NOT EXISTS con UPDLOCK/HOLDLOCK evita duplicados bajo concurrencia
+    //        var sql = @"
+    //IF NOT EXISTS (
+    //    SELECT 1 FROM RateLimitIdentity WITH (UPDLOCK, HOLDLOCK)
+    //    WHERE [Kind] = @p0 AND KeyHash = @p1
+    //)
+    //BEGIN
+    //    INSERT INTO RateLimitIdentity([Kind], KeyHash, KeyPlain, TenantId, ClientId, UserId, Ip)
+    //    VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6);
+    //END";
+
+    //        await db.Database.ExecuteSqlRawAsync(sql, new object[]
+    //        {
+    //            row.Kind,
+    //            row.KeyHash,
+    //            (object?)row.KeyPlain ?? DBNull.Value,
+    //            (object?)row.TenantId ?? DBNull.Value,
+    //            (object?)row.ClientId ?? DBNull.Value,
+    //            (object?)row.UserId ?? DBNull.Value,
+    //            (object?)row.Ip ?? DBNull.Value
+    //        }, ct);
+    //    }
 
     // Reusa el MERGE pero usando el MISMO DbContext/Tx (clave para atomicidad)
     private static async Task UpsertMinuteAggInternalAsync(AppConfigDbContext db, RateLimitMinuteAgg row, CancellationToken ct)

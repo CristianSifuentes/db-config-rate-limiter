@@ -4,10 +4,11 @@ select * from [dbo].[ConfigConcepts]
 ------------------------------
 
 select * from [dbo].[ConfigEntries]
+--update [dbo].[ConfigEntries] set Value = '{"exports":{"perTenantPerMinute":6,"perClientPerMinute":3,"perUserPerMinute":1},"search":{"perTenantPerMinute":9,"perClientPerMinute":6,"perUserPerMinute":2},"login":{"perIpPerMinute":1,"perClientPerMinute":6}}' where id = 2
 
 -- global
 --{
---  "perIdentityPerMinute": 300,
+--  "perIdentityPerMinute": 3,
 --  "burstPer10Seconds": 50
 --}
 
@@ -16,17 +17,17 @@ select * from [dbo].[ConfigEntries]
 -- enterprise
 --{
 --  "exports": {
---    "perTenantPerMinute": 600,
---    "perClientPerMinute": 300,
---    "perUserPerMinute": 120
+--    "perTenantPerMinute": 6,
+--    "perClientPerMinute": 3,
+--    "perUserPerMinute": 1
 --  },
 --  "search": {
---    "perTenantPerMinute": 900,
---    "perClientPerMinute": 600,
---    "perUserPerMinute": 240
+--    "perTenantPerMinute": 9,
+--    "perClientPerMinute": 6,
+--    "perUserPerMinute": 2
 --  },
 --  "login": {
---    "perIpPerMinute": 30,
+--    "perIpPerMinute": 1,
 --    "perClientPerMinute": 60
 --  }
 --}

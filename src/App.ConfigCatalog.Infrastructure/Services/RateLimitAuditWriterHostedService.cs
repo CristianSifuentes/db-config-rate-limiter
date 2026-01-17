@@ -1,6 +1,8 @@
+
 using Microsoft.Extensions.Hosting;
 using App.ConfigCatalog.Domain;
 using App.ConfigCatalog.Infrastructure.Entities;
+using App.ConfigCatalog.Infrastructure.RateLimiting.Audit;
 using App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
 using System.Security.Cryptography;
 using System.Text;
@@ -47,19 +49,28 @@ public sealed class RateLimitAuditWriterHostedService : BackgroundService
     {
         if (events.Count == 0) return;
 
-        // 1) agregación por minuto
-        var groups = events.GroupBy(e => new
-        {
-            Window = TruncateToMinute(e.AtUtc.UtcDateTime),
-            e.Policy,
-            e.IdentityKind,
-            IdentityHash = Sha256(e.IdentityKey),
-            e.Method
-        });
+        // -----------------------------
+        // A) Identities (dedup Kind+Hash)
+        // -----------------------------
+        var identities = events
+            .Select(RateLimitIdentityFactory.FromEvent)
+            .GroupBy(i => new { i.Kind, Hash = Convert.ToBase64String(i.KeyHash) })
+            .Select(g => g.First())
+            .ToList();
 
-        foreach (var g in groups)
-        {
-            var agg = new RateLimitMinuteAgg
+        // -----------------------------
+        // B) Minute aggregations
+        // -----------------------------
+        var minuteAggs = events
+            .GroupBy(e => new
+            {
+                Window = TruncateToMinute(e.AtUtc.UtcDateTime),
+                e.Policy,
+                e.IdentityKind,
+                IdentityHash = Sha256(e.IdentityKey),
+                e.Method
+            })
+            .Select(g => new RateLimitMinuteAgg
             {
                 WindowStartUtc = g.Key.Window,
                 Policy = g.Key.Policy,
@@ -68,12 +79,12 @@ public sealed class RateLimitAuditWriterHostedService : BackgroundService
                 Method = g.Key.Method,
                 Requests = g.LongCount(),
                 Rejected = g.LongCount(x => x.Rejected),
-            };
+            })
+            .ToList();
 
-            await _store.UpsertMinuteAggAsync(agg, ct);
-        }
-
-        // 2) violaciones (solo 429)
+        // -----------------------------
+        // C) Violations (429 only)
+        // -----------------------------
         var violations = events
             .Where(e => e.Rejected)
             .Select(v => new RateLimitViolation
@@ -92,16 +103,272 @@ public sealed class RateLimitAuditWriterHostedService : BackgroundService
             })
             .ToList();
 
-        if (violations.Count > 0)
-            await _store.AddViolationsAsync(violations, ct);
+        // ✅ UNA sola llamada: atomicidad (identities + aggs + violations)
+        await _store.PersistAsync(identities, minuteAggs, violations, ct);
 
         static DateTime TruncateToMinute(DateTime utc)
-            => new DateTime(utc.Year, utc.Month, utc.Day, utc.Hour, utc.Minute, 0, DateTimeKind.Utc);
+            => new(utc.Year, utc.Month, utc.Day, utc.Hour, utc.Minute, 0, DateTimeKind.Utc);
 
         static byte[] Sha256(string s)
             => SHA256.HashData(Encoding.UTF8.GetBytes(s));
     }
 }
+
+
+//using Microsoft.Extensions.Hosting;
+//using App.ConfigCatalog.Domain;
+//using App.ConfigCatalog.Infrastructure.Entities;
+//using App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
+//using System.Security.Cryptography;
+//using System.Text;
+//using System.Threading.Channels;
+
+//public sealed class RateLimitAuditWriterHostedService : BackgroundService
+//{
+//    private readonly ChannelReader<RateLimitAuditEvent> _reader;
+//    private readonly IRateLimitAuditStore _store;
+
+//    public RateLimitAuditWriterHostedService(
+//        ChannelReader<RateLimitAuditEvent> reader,
+//        IRateLimitAuditStore store)
+//    {
+//        _reader = reader;
+//        _store = store;
+//    }
+
+//    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+//    {
+//        var batch = new List<RateLimitAuditEvent>(capacity: 2000);
+
+//        while (!stoppingToken.IsCancellationRequested)
+//        {
+//            try
+//            {
+//                var item = await _reader.ReadAsync(stoppingToken);
+//                batch.Add(item);
+
+//                while (_reader.TryRead(out var next))
+//                {
+//                    batch.Add(next);
+//                    if (batch.Count >= 2000) break;
+//                }
+
+//                await FlushAsync(batch, stoppingToken);
+//                batch.Clear();
+//            }
+//            catch (OperationCanceledException) { }
+//        }
+//    }
+
+//    private async Task FlushAsync(List<RateLimitAuditEvent> events, CancellationToken ct)
+//    {
+//        if (events.Count == 0) return;
+
+//        // =========================
+//        // 0) Identity dimension rows
+//        // =========================
+//        // Importante: KeyHash SIEMPRE desde IdentityKey (la llave estable de rate limiting)
+//        // y dedup por Kind+Hash para evitar roundtrips.
+//        var identities = events
+//            .Select(e => BuildIdentity(e))
+//            .Where(x => x is not null)
+//            .Cast<RateLimitIdentity>()
+//            .GroupBy(x => new { x.Kind, Hash = Convert.ToBase64String(x.KeyHash) })
+//            .Select(g => g.First())
+//            .ToList();
+
+//        // =========================
+//        // 1) Minute aggregations
+//        // =========================
+//        var minuteAggs = events
+//            .GroupBy(e => new
+//            {
+//                Window = TruncateToMinute(e.AtUtc.UtcDateTime),
+//                e.Policy,
+//                e.IdentityKind,
+//                IdentityHash = Sha256(e.IdentityKey),
+//                e.Method
+//            })
+//            .Select(g => new RateLimitMinuteAgg
+//            {
+//                WindowStartUtc = g.Key.Window,
+//                Policy = g.Key.Policy,
+//                IdentityKind = g.Key.IdentityKind,
+//                IdentityHash = g.Key.IdentityHash,
+//                Method = g.Key.Method,
+//                Requests = g.LongCount(),
+//                Rejected = g.LongCount(x => x.Rejected)
+//            })
+//            .ToList();
+
+//        // =========================
+//        // 2) Violations (solo 429 / rejected)
+//        // =========================
+//        var violations = events
+//            .Where(e => e.Rejected)
+//            .Select(v => new RateLimitViolation
+//            {
+//                AtUtc = v.AtUtc.UtcDateTime,
+//                Policy = v.Policy,
+//                IdentityKind = v.IdentityKind,
+//                IdentityHash = Sha256(v.IdentityKey),
+
+//                TraceId = v.TraceId,
+//                CorrelationId = v.CorrelationId,
+
+//                Path = v.Path,
+//                Method = v.Method,
+//                StatusCode = v.StatusCode,
+//                RetryAfterSeconds = v.RetryAfterSeconds,
+//                Reason = v.Reason
+//            })
+//            .ToList();
+
+//        // =========================
+//        // 3) One atomic persist
+//        // =========================
+//        await _store.PersistAsync(identities, minuteAggs, violations, ct);
+
+//        static DateTime TruncateToMinute(DateTime utc)
+//            => new(utc.Year, utc.Month, utc.Day, utc.Hour, utc.Minute, 0, DateTimeKind.Utc);
+
+//        static byte[] Sha256(string s)
+//            => SHA256.HashData(Encoding.UTF8.GetBytes(s));
+
+//        static RateLimitIdentity? BuildIdentity(RateLimitAuditEvent e)
+//        {
+//            // Si IdentityKey no existe, no podemos indexar seguro -> no insertes.
+//            if (string.IsNullOrWhiteSpace(e.IdentityKey)) return null;
+
+//            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(e.IdentityKey));
+
+//            // KeyPlain: solo si NO es PII o si viene ya enmascarado (recomendado).
+//            // Ej: "tenant:1" ok, "ip:1.2.3.4" mejor enmascarado, "user:{oid}" depende de tu política.
+//            var keyPlain = string.IsNullOrWhiteSpace(e.KeyPlain) ? null : e.KeyPlain;
+
+//            return new RateLimitIdentity
+//            {
+//                Kind = e.IdentityKind,    // Tenant|Client|User|Ip
+//                KeyHash = hash,
+//                KeyPlain = keyPlain,
+
+//                // Enrichment opcional (si lo tienes en el evento)
+//                TenantId = e.TenantId,
+//                ClientId = e.ClientId,
+//                UserId = e.UserId,
+//                Ip = e.Ip,
+
+//                CreatedAtUtc = DateTime.UtcNow
+//            };
+//        }
+//    }
+//}
+
+
+//using Microsoft.Extensions.Hosting;
+//using App.ConfigCatalog.Domain;
+//using App.ConfigCatalog.Infrastructure.Entities;
+//using App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
+//using System.Security.Cryptography;
+//using System.Text;
+//using System.Threading.Channels;
+
+//public sealed class RateLimitAuditWriterHostedService : BackgroundService
+//{
+//    private readonly ChannelReader<RateLimitAuditEvent> _reader;
+//    private readonly IRateLimitAuditStore _store;
+
+//    public RateLimitAuditWriterHostedService(
+//        ChannelReader<RateLimitAuditEvent> reader,
+//        IRateLimitAuditStore store)
+//    {
+//        _reader = reader;
+//        _store = store;
+//    }
+
+//    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+//    {
+//        var batch = new List<RateLimitAuditEvent>(capacity: 2000);
+
+//        while (!stoppingToken.IsCancellationRequested)
+//        {
+//            try
+//            {
+//                var item = await _reader.ReadAsync(stoppingToken);
+//                batch.Add(item);
+
+//                while (_reader.TryRead(out var next))
+//                {
+//                    batch.Add(next);
+//                    if (batch.Count >= 2000) break;
+//                }
+
+//                await FlushAsync(batch, stoppingToken);
+//                batch.Clear();
+//            }
+//            catch (OperationCanceledException) { }
+//        }
+//    }
+
+//    private async Task FlushAsync(List<RateLimitAuditEvent> events, CancellationToken ct)
+//    {
+//        if (events.Count == 0) return;
+
+//        // 1) agregación por minuto
+//        var groups = events.GroupBy(e => new
+//        {
+//            Window = TruncateToMinute(e.AtUtc.UtcDateTime),
+//            e.Policy,
+//            e.IdentityKind,
+//            IdentityHash = Sha256(e.IdentityKey),
+//            e.Method
+//        });
+
+//        foreach (var g in groups)
+//        {
+//            var agg = new RateLimitMinuteAgg
+//            {
+//                WindowStartUtc = g.Key.Window,
+//                Policy = g.Key.Policy,
+//                IdentityKind = g.Key.IdentityKind,
+//                IdentityHash = g.Key.IdentityHash,
+//                Method = g.Key.Method,
+//                Requests = g.LongCount(),
+//                Rejected = g.LongCount(x => x.Rejected),
+//            };
+
+//            await _store.UpsertMinuteAggAsync(agg, ct);
+//        }
+
+//        // 2) violaciones (solo 429)
+//        var violations = events
+//            .Where(e => e.Rejected)
+//            .Select(v => new RateLimitViolation
+//            {
+//                AtUtc = v.AtUtc.UtcDateTime,
+//                Policy = v.Policy,
+//                IdentityKind = v.IdentityKind,
+//                IdentityHash = Sha256(v.IdentityKey),
+//                TraceId = v.TraceId,
+//                CorrelationId = v.CorrelationId,
+//                Path = v.Path,
+//                Method = v.Method,
+//                StatusCode = v.StatusCode,
+//                RetryAfterSeconds = v.RetryAfterSeconds,
+//                Reason = v.Reason
+//            })
+//            .ToList();
+
+//        if (violations.Count > 0)
+//            await _store.AddViolationsAsync(violations, ct);
+
+//        static DateTime TruncateToMinute(DateTime utc)
+//            => new DateTime(utc.Year, utc.Month, utc.Day, utc.Hour, utc.Minute, 0, DateTimeKind.Utc);
+
+//        static byte[] Sha256(string s)
+//            => SHA256.HashData(Encoding.UTF8.GetBytes(s));
+//    }
+//}
 
 
 //using Microsoft.EntityFrameworkCore;
