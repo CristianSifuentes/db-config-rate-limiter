@@ -1,31 +1,37 @@
-using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.AspNetCore.RateLimiting;
-using Microsoft.EntityFrameworkCore;
 using App.ConfigCatalog.Api;
+using App.ConfigCatalog.Api.Middleware;
+using App.ConfigCatalog.Api.Security;
 using App.ConfigCatalog.Domain;
 using App.ConfigCatalog.Infrastructure;
 using App.ConfigCatalog.Infrastructure.RateLimiting;
 using App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces;
 using App.ConfigCatalog.Infrastructure.RateLimiting.Store;
 using App.ConfigCatalog.Infrastructure.Services;
+using App.ConfigCatalog.Infrastructure.Token;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 using System.Threading.Channels;
 using System.Threading.RateLimiting;
 using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.IdentityModel.Tokens;
-using App.ConfigCatalog.Infrastructure.Token;
-using System.IdentityModel.Tokens.Jwt;
+using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddEndpointsApiExplorer();
+
 builder.Services.AddSwaggerGen();
 
 // Application Insights (optional): enabled when APPLICATIONINSIGHTS_CONNECTION_STRING is set.
 builder.Services.AddApplicationInsightsTelemetry();
 
 builder.Services.AddMemoryCache();
-
 
 #region Configuration (Options & Entra)
 
@@ -148,8 +154,58 @@ builder.Services
         {
             OnTokenValidated = async ctx =>
             {
+                // Defense-in-depth: explicitly reject alg=none and unknown algorithms.
+                if (ctx.SecurityToken is JwtSecurityToken jwt)
+                {
+                    var alg = jwt.Header.Alg;
 
-                Console.WriteLine(ctx.Principal.Claims.Count().ToString());
+                    if (string.Equals(alg, "none", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Fail("Rejected unsigned JWT (alg=none).");
+                        return;
+                    }
+
+                    if (alg is null ||
+                        !(alg.Equals("RS256", StringComparison.OrdinalIgnoreCase) ||
+                          alg.Equals("ES256", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        ctx.Fail($"Rejected JWT with unsupported alg='{alg}'.");
+                        return;
+                    }
+                }
+
+                // Optional token replay / revocation checks using jti.
+                // NOTE: Entra access tokens may not always carry "jti"; treat it as best-effort unless you enforce it.
+                var revocation = ctx.HttpContext.RequestServices.GetRequiredService<ITokenRevocationStore>();
+                var hard = ctx.HttpContext.RequestServices.GetRequiredService<IOptions<TokenHardeningOptions>>().Value;
+
+                if (hard.EnableJtiReplayProtection)
+                {
+                    var jti = ctx.Principal?.FindFirstValue(JwtRegisteredClaimNames.Jti);
+
+                    if (!string.IsNullOrWhiteSpace(jti))
+                    {
+                        // 1) If revoked -> block.
+                        if (await revocation.IsRevokedAsync(jti, ctx.HttpContext.RequestAborted))
+                        {
+                            ctx.Fail("Token has been revoked.");
+                            return;
+                        }
+
+                        // 2) Replay detection -> block if "jti" observed before.
+                        // Disable this if your usage model expects reusing the same access token frequently.
+                        var replayOk = await revocation.TryMarkSeenAsync(
+                            jti,
+                            TimeSpan.FromMinutes(hard.JtiCacheMinutes),
+                            ctx.HttpContext.RequestAborted);
+
+                        if (!replayOk)
+                        {
+                            ctx.Fail("Token replay detected (jti reused).");
+                            return;
+                        }
+                    }
+                }
             },
 
             OnAuthenticationFailed = ctx =>
@@ -192,9 +248,60 @@ builder.Services
 builder.Services.AddAuthorization(options =>
 {
     // Centralized configuration: keep policy definitions in one place.
-    AuthzPolicies.Configure(options, builder.Configuration);
+    //AuthzPolicies.Configure(options, builder.Configuration);
 
     #region Relevant1
+    options.AddPolicy("Public", policy =>
+    {
+        policy.RequireAuthenticatedUser();
+
+        #region  validate that it comes from specific clients (azp/appid) 
+        // Optional: validate that it comes from specific clients (azp/appid)
+        //policy.RequireAssertion(ctx =>
+        //{
+        //    var appId = ctx.User.FindFirst("azp")?.Value
+        //               ?? ctx.User.FindFirst("appid")?.Value;
+
+        //    var allowedClients = new[]
+        //    {
+        //          ApplicationContext.AppSettings.AzureAd.ClientId,
+        //            ApplicationContext.AppSettings.AzureAd.Internal.ClientId
+        //       };
+
+        //    return !string.IsNullOrWhiteSpace(appId) && allowedClients.Contains(appId);
+        //});
+
+
+        #endregion
+
+        policy.RequireAssertion(ctx =>
+        {
+            var scp = ctx.User.FindFirst("scp")?.Value ?? "";
+            var scopes = scp.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            // “old” claim en algunos stacks
+            var scopesOld = ctx.User.Claims
+                .Where(c => c.Type == "http://schemas.microsoft.com/identity/claims/scope")
+                .SelectMany(c => (c.Value ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .ToArray();
+
+            var roles = ctx.User.FindAll("roles").Select(r => r.Value).ToArray();
+
+            var allowedScopes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            "Documents.Read"
+                        };
+
+            var allowedRoles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            "Reports.Read.All"
+                        };
+
+            return scopes.Any(allowedScopes.Contains)
+                || scopesOld.Any(allowedScopes.Contains)
+                || roles.Any(allowedRoles.Contains);
+        });
+    });
     //// Example "role-only" policy (use sparingly; scopes/app roles are usually better in multi-tenant APIs).
     //options.AddPolicy("AdminOnly", p =>
     //{
@@ -518,11 +625,15 @@ builder.Services.AddRateLimiter(o =>
 #endregion
 
 #region Dependency Injection (Services + Middleware)
+
+builder.Services.AddDistributedMemoryCache();
+
 // --- Config catalog services ---
 builder.Services.AddSingleton<IConfigProvider, DbConfigProvider>();
 
 builder.Services.AddSingleton<RateLimitConfigAccessor>();
 builder.Services.AddSingleton<IRateLimitConfigAccessor>(sp => sp.GetRequiredService<RateLimitConfigAccessor>());
+builder.Services.AddSingleton<ITokenRevocationStore, DistributedTokenRevocationStore>();
 
 builder.Services.AddHostedService<RateLimitConfigWarmupHostedService>();
 
@@ -534,6 +645,7 @@ builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAudit
 builder.Services.AddSingleton(sp => sp.GetRequiredService<Channel<RateLimitAuditEvent>>().Reader);
 
 builder.Services.AddSingleton<RateLimitAuditMiddleware>();
+builder.Services.AddScoped<RateLimitBlockMiddleware>();
 
 builder.Services.AddSingleton<IRateLimitAuditStore, SqlServerRateLimitAuditStore>();
 
@@ -565,19 +677,35 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 
 #region Security Middleware (Pre-Auth)
-app.UseMiddleware<RateLimitAuditMiddleware>();
 
+// 1) Auditar TODO (outer wrapper)
+app.UseMiddleware<RateLimitAuditMiddleware>();    // wrapper para auditar TODO (incluye blocked)
+
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
 #endregion
 
 
 #region AuthN / AuthZ
 
-app.UseRateLimiter();
 
 // Authentication populates HttpContext.User.
+
+// 2) AuthN primero (para poder bloquear por tenant/user/client con claims)
 app.UseAuthentication();
 
+// 3) Cortar temprano si está bloqueado (antes de RateLimiter)
+app.UseMiddleware<RateLimitBlockMiddleware>();
+
+// 4) Luego rate limiting
+app.UseRateLimiter();
+
+
 // Authorization enforces policies/scopes/roles.
+// 5) AuthZ
+
 app.UseAuthorization();
 #endregion
 
@@ -592,9 +720,62 @@ app.MapGet("/limits/current", (IRateLimitConfigAccessor a) => Results.Ok(new
 }));
 
 // A heavy endpoint to demonstrate policy usage
-app.MapGet("/exports", () => Results.Ok(new { exported = true, atUtc = DateTime.UtcNow }))
-   .RequireRateLimiting("exports-tenant")
-   .RequireAuthorization(AuthzPolicies.DocumentsReadPolicyName);
+//app.MapGet("/exports", () => Results.Ok(new { exported = true, atUtc = DateTime.UtcNow }))
+//   .RequireRateLimiting("exports-tenant")
+//   .RequireAuthorization(AuthzPolicies.PublicPolicyName);
+app.MapGet("/exports", (
+    HttpContext http,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    //// Validate BEFORE touching the data layer (cheap rejection).
+    //var validation = SearchQueryValidator.Validate(q);
+    //if (!validation.ok)
+    //{
+    //    return Results.BadRequest(new
+    //    {
+    //        error = "invalid_query",
+    //        message = validation.error,
+    //        traceId = http.TraceIdentifier
+    //    });
+    //}
+    return Results.Ok();
+
+
+})
+.RequireRateLimiting("search-tenant")
+.RequireAuthorization(AuthzPolicies.PublicPolicyName);
+
+
+
+app.MapGet("/search", (
+    HttpContext http,
+    ClaimsPrincipal user) =>
+{
+    var tenant = TenantContextFactory.From(user);
+    if (string.IsNullOrWhiteSpace(tenant.TenantId))
+        return Results.Forbid();
+
+    //// Validate BEFORE touching the data layer (cheap rejection).
+    //var validation = SearchQueryValidator.Validate(q);
+    //if (!validation.ok)
+    //{
+    //    return Results.BadRequest(new
+    //    {
+    //        error = "invalid_query",
+    //        message = validation.error,
+    //        traceId = http.TraceIdentifier
+    //    });
+    //}
+    return Results.Ok();
+
+
+})
+.RequireRateLimiting("search-tenant")
+.RequireAuthorization(AuthzPolicies.PublicPolicyName);
 
 
 // --- Admin: manage config entries (MVP). Secure this in real apps. ---

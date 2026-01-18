@@ -35,5 +35,7 @@ select * from [dbo].[ConfigEntries]
 select * from [dbo].[RateLimitIdentity]
 select * from [dbo].[RateLimitMinuteAgg]
 select * from [dbo].[RateLimitViolation]
+select * from [dbo].[RateLimitBlock]
+
 select * from [dbo].[RateLimitViolationRows]
 

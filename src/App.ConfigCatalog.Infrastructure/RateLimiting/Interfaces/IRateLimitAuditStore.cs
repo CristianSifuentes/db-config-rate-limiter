@@ -24,5 +24,12 @@ namespace App.ConfigCatalog.Infrastructure.RateLimiting.Interfaces
                   IEnumerable<RateLimitMinuteAgg> minuteAggs,
                   IEnumerable<RateLimitViolation> violations,
                   CancellationToken ct);
+
+        Task PersistAsync(
+                    IEnumerable<RateLimitIdentity> identities,
+                    IEnumerable<RateLimitMinuteAgg> minuteAggs,
+                    IEnumerable<RateLimitViolation> violations,
+                    IEnumerable<RateLimitBlock> blocks,
+                    CancellationToken ct);
     }
 }

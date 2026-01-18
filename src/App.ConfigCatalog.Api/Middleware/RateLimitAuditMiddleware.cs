@@ -4,8 +4,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.Http;
+using App.ConfigCatalog.Api.Security;
 
-namespace App.ConfigCatalog.Api
+namespace App.ConfigCatalog.Api.Middleware
 {
     public sealed class RateLimitAuditMiddleware : IMiddleware
     {

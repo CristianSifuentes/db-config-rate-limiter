@@ -188,22 +188,23 @@ WHEN NOT MATCHED THEN
             }
         });
     }
+
     private static async Task EnsureIdentityInternalAsync(
     AppConfigDbContext db,
     RateLimitIdentity row,
     CancellationToken ct)
     {
         const string sql = @"
-IF NOT EXISTS (
-    SELECT 1 FROM RateLimitIdentity WITH (UPDLOCK, HOLDLOCK)
-    WHERE [Kind] = @Kind AND KeyHash = @KeyHash
-)
-BEGIN
-    INSERT INTO RateLimitIdentity
-        ([Kind], KeyHash, KeyPlain, TenantId, ClientId, UserId, Ip)
-    VALUES
-        (@Kind, @KeyHash, @KeyPlain, @TenantId, @ClientId, @UserId, @Ip);
-END";
+                            IF NOT EXISTS (
+                                SELECT 1 FROM RateLimitIdentity WITH (UPDLOCK, HOLDLOCK)
+                                WHERE [Kind] = @Kind AND KeyHash = @KeyHash
+                            )
+                            BEGIN
+                                INSERT INTO RateLimitIdentity
+                                    ([Kind], KeyHash, KeyPlain, TenantId, ClientId, UserId, Ip)
+                                VALUES
+                                    (@Kind, @KeyHash, @KeyPlain, @TenantId, @ClientId, @UserId, @Ip);
+                            END";
 
         // IMPORTANTE: SqlParameter.Value = DBNull.Value (aquí sí es válido)
         // porque EF recibe SqlParameter (no un object DBNull suelto).
@@ -260,21 +261,21 @@ END";
     private static async Task UpsertMinuteAggInternalAsync(AppConfigDbContext db, RateLimitMinuteAgg row, CancellationToken ct)
     {
         var sql = @"
-MERGE RateLimitMinuteAgg WITH (HOLDLOCK) AS T
-USING (VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6)) AS S
-    (WindowStartUtc, Policy, IdentityKind, IdentityHash, Method, Requests, Rejected)
-ON  T.WindowStartUtc = S.WindowStartUtc
-AND T.Policy         = S.Policy
-AND T.IdentityKind   = S.IdentityKind
-AND T.IdentityHash   = S.IdentityHash
-WHEN MATCHED THEN
-    UPDATE SET
-        T.Method    = COALESCE(S.Method, T.Method),
-        T.Requests  = T.Requests + S.Requests,
-        T.Rejected  = T.Rejected + S.Rejected
-WHEN NOT MATCHED THEN
-    INSERT (WindowStartUtc, Policy, IdentityKind, IdentityHash, Method, Requests, Rejected)
-    VALUES (S.WindowStartUtc, S.Policy, S.IdentityKind, S.IdentityHash, S.Method, S.Requests, S.Rejected);";
+                    MERGE RateLimitMinuteAgg WITH (HOLDLOCK) AS T
+                    USING (VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6)) AS S
+                        (WindowStartUtc, Policy, IdentityKind, IdentityHash, Method, Requests, Rejected)
+                    ON  T.WindowStartUtc = S.WindowStartUtc
+                    AND T.Policy         = S.Policy
+                    AND T.IdentityKind   = S.IdentityKind
+                    AND T.IdentityHash   = S.IdentityHash
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            T.Method    = COALESCE(S.Method, T.Method),
+                            T.Requests  = T.Requests + S.Requests,
+                            T.Rejected  = T.Rejected + S.Rejected
+                    WHEN NOT MATCHED THEN
+                        INSERT (WindowStartUtc, Policy, IdentityKind, IdentityHash, Method, Requests, Rejected)
+                        VALUES (S.WindowStartUtc, S.Policy, S.IdentityKind, S.IdentityHash, S.Method, S.Requests, S.Rejected);";
 
         await db.Database.ExecuteSqlRawAsync(
             sql,
@@ -289,6 +290,11 @@ WHEN NOT MATCHED THEN
                 row.Rejected
             },
             cancellationToken: ct);
+    }
+
+    public Task PersistAsync(IEnumerable<RateLimitIdentity> identities, IEnumerable<RateLimitMinuteAgg> minuteAggs, IEnumerable<RateLimitViolation> violations, IEnumerable<RateLimitBlock> blocks, CancellationToken ct)
+    {
+        throw new NotImplementedException();
     }
 }
 

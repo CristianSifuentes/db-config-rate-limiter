@@ -134,28 +134,29 @@ public sealed class AppConfigDbContext : DbContext
              .HasDatabaseName("IX_RateLimitBlock_Identity_Until");
         });
 
-        modelBuilder.Entity<RateLimitViolationRow>(b =>
-        {
-            b.HasNoKey();
 
-            // Opción 1: map a VIEW (recomendado)
-            // b.ToView("vw_RateLimitViolation");
+        //modelBuilder.Entity<RateLimitViolationRow>(b =>
+        //{
+        //    b.HasNoKey();
 
-            // Opción 2: si NO usas view, no lo mapees a nada
-            // y úsalo solo con FromSql en un repositorio.
+        //    // Opción 1: map a VIEW (recomendado)
+        //    // b.ToView("vw_RateLimitViolation");
 
-            b.Property(x => x.Policy).HasMaxLength(64);
-            b.Property(x => x.IdentityKind).HasMaxLength(20);
-            b.Property(x => x.Method).HasMaxLength(8);
-            b.Property(x => x.Path).HasMaxLength(512);
-        });
+        //    // Opción 2: si NO usas view, no lo mapees a nada
+        //    // y úsalo solo con FromSql en un repositorio.
 
-        // Read-model mapping (VIEW)
-        modelBuilder.Entity<RateLimitMinuteAggRow>(b =>
-        {
-            b.HasNoKey();
-            b.ToView("vw_RateLimitMinuteAgg"); // crea este VIEW en SQL (ideal)
-        });
+        //    b.Property(x => x.Policy).HasMaxLength(64);
+        //    b.Property(x => x.IdentityKind).HasMaxLength(20);
+        //    b.Property(x => x.Method).HasMaxLength(8);
+        //    b.Property(x => x.Path).HasMaxLength(512);
+        //});
+
+        //// Read-model mapping (VIEW)
+        //modelBuilder.Entity<RateLimitMinuteAggRow>(b =>
+        //{
+        //    b.HasNoKey();
+        //    b.ToView("vw_RateLimitMinuteAgg"); // crea este VIEW en SQL (ideal)
+        //});
 
     }
 }

@@ -103,6 +103,10 @@ public sealed class RateLimitAuditWriterHostedService : BackgroundService
             })
             .ToList();
 
+
+        var blocks = BuildBlocks(events).ToList();
+
+
         // ✅ UNA sola llamada: atomicidad (identities + aggs + violations)
         await _store.PersistAsync(identities, minuteAggs, violations, ct);
 
@@ -111,7 +115,34 @@ public sealed class RateLimitAuditWriterHostedService : BackgroundService
 
         static byte[] Sha256(string s)
             => SHA256.HashData(Encoding.UTF8.GetBytes(s));
+
+        static IEnumerable<RateLimitBlock> BuildBlocks(IEnumerable<RateLimitAuditEvent> events)
+        {
+            // Ejemplo: proteger login-ip (credential stuffing)
+            var now = DateTime.UtcNow;
+
+            var loginRejectsByIp = events
+                .Where(e => e.Policy == "login-ip" && e.IdentityKind == "Ip" && e.Rejected)
+                .GroupBy(e => e.IdentityKey);
+
+            foreach (var g in loginRejectsByIp)
+            {
+                // umbral por batch (mejor aún: umbral por ventana consultando DB/agg)
+                if (g.Count() >= 10) // ejemplo: 10 rechazos en 1 batch => block corto
+                {
+                    yield return new RateLimitBlock
+                    {
+                        IdentityKind = "Ip",
+                        IdentityHash = SHA256.HashData(Encoding.UTF8.GetBytes(g.Key)),
+                        Reason = "login_ip_stuffing",
+                        BlockedUntilUtc = now.AddMinutes(10),
+                        CreatedAtUtc = now
+                    };
+                }
+            }
+        }
     }
+
 }
 
 

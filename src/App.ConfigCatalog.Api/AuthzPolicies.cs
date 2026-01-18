@@ -16,6 +16,7 @@ namespace App.ConfigCatalog.Api
     {
         public const string DocumentsReadPolicyName = "Documents.Read";
         public const string ReportsReadPolicyName = "Reports.Read";
+        public const string PublicPolicyName = "Public";
 
         public static void Configure(AuthorizationOptions options, IConfiguration config)
         {
