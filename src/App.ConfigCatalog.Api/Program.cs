@@ -21,6 +21,7 @@ using System.Threading.Channels;
 using System.Threading.RateLimiting;
 using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
 using Microsoft.AspNetCore.HttpOverrides;
+using SPARK.Domain.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -94,6 +95,7 @@ builder.Services.AddDbContextFactory<AppConfigDbContext>(opt =>
 //builder.Services.AddRateLimiter(o => { o.AddConcurrencyLimiter() });
 
 // --- Rate limiting configured from DB-backed accessor ---
+
 #region Authentication (JWT Bearer) — Hardened Validation
 
 builder.Services
